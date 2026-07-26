@@ -24,8 +24,10 @@
   | usearch ef=200 | 0.9953 | 5,640 | 1,809us |
 
   → M1 的 Go/No-Go 线:recall@10≥0.95 时 QPS ≥ ~13k(usearch 同召回的 70%)
-- [ ] **M1 内存版 Vamana**(2-3 周):建图 + beam search。
-  Go/No-Go:SIFT1M recall@10≥0.95 时 QPS ≥ hnswlib 的 70%
+- [x] **M1 内存版 Vamana**:建图(RobustPrune + 两轮并行插入,129s)+ beam search。
+  Go/No-Go 通过:recall@10=0.955 时 **24.6k QPS**(目标 13k 的 189%),
+  召回-QPS 曲线与 usearch 重合(0.97 召回档:16.7k vs 16.3k)。
+  M2 关键数据:ef=80 时平均 86 跳 → 磁盘版每查询 ~86 次块读
 - [ ] **M2 磁盘布局 + 同步 I/O**(2 周):4KB 节点块格式定稿,pread 版磁盘搜索。
   验证:I/O 次数 ≈ beam 步数 × W,recall 与内存版一致
 - [ ] **M3 io_uring 异步流水线**(3-4 周,核心):O_DIRECT + 注册 buffer +

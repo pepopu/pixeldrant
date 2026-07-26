@@ -1,12 +1,10 @@
 [package]
-name = "nvvec-bench"
+name = "nvvec-index"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 nvvec-core = { workspace = true }
-nvvec-index = { workspace = true }
-anyhow = { workspace = true }
-clap = { workspace = true }
+parking_lot = { workspace = true }
 rayon = { workspace = true }

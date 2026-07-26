@@ -37,6 +37,14 @@ cargo run --release -p nvvec-bench -- check --data-dir data/sift
 cargo run --release -p nvvec-bench -- brute --data-dir data/sift --queries 1000 --csv results/all.csv
 ```
 
+Build and benchmark the Vamana index (M1, in-memory; `--graph` caches the
+built graph so later ef sweeps skip the build):
+
+```bash
+cargo run --release -p nvvec-bench -- vamana --data-dir data/sift \
+    --graph data/sift/vamana_R32_L100_a1.2.graph --csv results/all.csv
+```
+
 Run the in-memory HNSW baseline (usearch — prebuilt wheels everywhere;
 on Linux also run `bench_hnswlib.py`, same schema):
 

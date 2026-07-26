@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/nvvec-core",
+    "crates/nvvec-index",
     "crates/nvvec-io",
     "crates/nvvec-bench",
 ]
@@ -13,9 +14,11 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 nvvec-core = { path = "crates/nvvec-core" }
+nvvec-index = { path = "crates/nvvec-index" }
 nvvec-io = { path = "crates/nvvec-io" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+parking_lot = "0.12"
 rayon = "1"
 
 [profile.release]

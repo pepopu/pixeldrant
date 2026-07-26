@@ -42,6 +42,37 @@ enum Cmd {
         #[arg(long)]
         csv: Option<PathBuf>,
     },
+    /// In-memory Vamana index (M1): build (or load cached graph), then
+    /// sweep ef for recall/QPS/latency.
+    Vamana {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long, default_value = "sift")]
+        prefix: String,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Max out-degree.
+        #[arg(long, default_value_t = 32)]
+        r: usize,
+        /// Candidate list size during construction.
+        #[arg(long, default_value_t = 100)]
+        l_build: usize,
+        /// Pruning slack.
+        #[arg(long, default_value_t = 1.2)]
+        alpha: f32,
+        /// Comma-separated ef values to sweep at query time.
+        #[arg(long, default_value = "10,20,40,60,80,120,200,400")]
+        efs: String,
+        /// Graph cache: load it if it exists, otherwise build and save here.
+        #[arg(long)]
+        graph: Option<PathBuf>,
+        /// Queries used for the single-threaded latency measurement.
+        #[arg(long, default_value_t = 1000)]
+        latency_queries: usize,
+        /// Append CSV result rows to this file.
+        #[arg(long)]
+        csv: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -50,7 +81,174 @@ fn main() -> Result<()> {
         Cmd::Brute { data_dir, prefix, k, queries, csv } => {
             brute_cmd(&data_dir, &prefix, k, queries, csv.as_deref())
         }
+        Cmd::Vamana {
+            data_dir,
+            prefix,
+            k,
+            r,
+            l_build,
+            alpha,
+            efs,
+            graph,
+            latency_queries,
+            csv,
+        } => vamana_cmd(VamanaArgs {
+            data_dir,
+            prefix,
+            k,
+            r,
+            l_build,
+            alpha,
+            efs,
+            graph,
+            latency_queries,
+            csv,
+        }),
     }
+}
+
+struct VamanaArgs {
+    data_dir: PathBuf,
+    prefix: String,
+    k: usize,
+    r: usize,
+    l_build: usize,
+    alpha: f32,
+    efs: String,
+    graph: Option<PathBuf>,
+    latency_queries: usize,
+    csv: Option<PathBuf>,
+}
+
+fn vamana_cmd(args: VamanaArgs) -> Result<()> {
+    use nvvec_index::{BuildParams, SearchScratch, VamanaGraph, beam_search};
+    use rayon::prelude::*;
+
+    let ds = load(&args.data_dir, &args.prefix)?;
+    if args.k > ds.ground_truth.dim {
+        bail!("k={} exceeds ground truth depth {}", args.k, ds.ground_truth.dim);
+    }
+
+    let graph = match &args.graph {
+        Some(path) if path.exists() => {
+            let g = VamanaGraph::load(path).context("loading graph cache")?;
+            if g.num_nodes() != ds.base.count {
+                bail!(
+                    "graph cache has {} nodes but dataset has {} — delete {} to rebuild",
+                    g.num_nodes(),
+                    ds.base.count,
+                    path.display()
+                );
+            }
+            eprintln!("loaded graph cache {} (avg degree {:.1})", path.display(), g.avg_degree());
+            g
+        }
+        maybe_path => {
+            let params = BuildParams { r: args.r, l_build: args.l_build, alpha: args.alpha };
+            eprintln!(
+                "building vamana: R={}, L={}, alpha={} ({} threads)...",
+                params.r,
+                params.l_build,
+                params.alpha,
+                rayon::current_num_threads()
+            );
+            let t = Instant::now();
+            let g = nvvec_index::build(&ds.base, &params);
+            eprintln!("build: {:.1?} (avg degree {:.1})", t.elapsed(), g.avg_degree());
+            if let Some(path) = maybe_path {
+                g.save(path).context("saving graph cache")?;
+                eprintln!("graph cached to {}", path.display());
+            }
+            g
+        }
+    };
+
+    let params_tag = format!("R{}-L{}-a{}", args.r, args.l_build, args.alpha);
+    let nq = ds.queries.count;
+    for ef in parse_efs(&args.efs)? {
+        if ef < args.k {
+            continue;
+        }
+        // Batch throughput: all queries across all threads.
+        let t = Instant::now();
+        let ids: Vec<Vec<u32>> = (0..nq)
+            .collect::<Vec<_>>()
+            .par_chunks(64)
+            .map_init(
+                || SearchScratch::new(ds.base.count),
+                |scratch, chunk| {
+                    chunk
+                        .iter()
+                        .map(|&qi| {
+                            beam_search(
+                                &ds.base,
+                                ds.queries.get(qi),
+                                graph.medoid,
+                                ef,
+                                |id, buf| {
+                                    buf.clear();
+                                    buf.extend_from_slice(graph.neighbors_of(id));
+                                },
+                                scratch,
+                            );
+                            scratch.top_k(args.k).map(|(_, id)| id).collect::<Vec<u32>>()
+                        })
+                        .collect::<Vec<_>>()
+                },
+            )
+            .flatten()
+            .collect();
+        let qps = nq as f64 / t.elapsed().as_secs_f64();
+        let recall = eval::recall_at_k(&ids, &ds.ground_truth, args.k);
+
+        // Single-threaded latency + hop count (hops = disk reads in M2).
+        let mut scratch = SearchScratch::new(ds.base.count);
+        let mut samples = Vec::with_capacity(args.latency_queries.min(nq));
+        let mut hops_total = 0usize;
+        for qi in 0..args.latency_queries.min(nq) {
+            let t = Instant::now();
+            hops_total += beam_search(
+                &ds.base,
+                ds.queries.get(qi),
+                graph.medoid,
+                ef,
+                |id, buf| {
+                    buf.clear();
+                    buf.extend_from_slice(graph.neighbors_of(id));
+                },
+                &mut scratch,
+            );
+            samples.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        let lat = eval::latency_stats(samples);
+        let mean_hops = hops_total as f64 / args.latency_queries.min(nq) as f64;
+
+        println!(
+            "ef={ef:4}  recall@{}={recall:.4}  qps={qps:8.0}  p50={:6.0}us  p99={:6.0}us  hops={mean_hops:.0}",
+            args.k, lat.p50_us, lat.p99_us
+        );
+        if let Some(path) = &args.csv {
+            append_csv(
+                path,
+                "vamana",
+                &format!("{params_tag}-ef{ef}"),
+                args.k,
+                recall,
+                qps,
+                Some(&lat),
+            )?;
+        }
+    }
+    if let Some(path) = &args.csv {
+        println!("csv rows appended to {}", path.display());
+    }
+    Ok(())
+}
+
+fn parse_efs(efs: &str) -> Result<Vec<usize>> {
+    efs.split(',')
+        .map(|s| s.trim().parse::<usize>().map_err(|e| anyhow::anyhow!("bad ef '{s}': {e}")))
+        .collect()
 }
 
 fn load(data_dir: &Path, prefix: &str) -> Result<dataset::BenchDataset> {
