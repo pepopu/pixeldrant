@@ -21,7 +21,7 @@ use std::path::Path;
 #[cfg(target_os = "linux")]
 pub mod uring;
 #[cfg(target_os = "linux")]
-pub use uring::{UringOpts, UringReader};
+pub use uring::{UringExecutor, UringOpts, UringReader};
 
 /// Block size in bytes. 4 KiB matches both NVMe atomic read granularity and
 /// the DiskANN node layout (vector + neighbor list packed in one block).

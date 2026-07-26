@@ -111,6 +111,38 @@ enum Cmd {
         #[arg(long)]
         csv: Option<PathBuf>,
     },
+    /// Cross-query pipelined search (M3b, Linux io_uring): one scheduler
+    /// thread, N query state machines sharing one deep ring.
+    Pipeline {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long, default_value = "sift")]
+        prefix: String,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Graph cache produced by the vamana command.
+        #[arg(long)]
+        graph: PathBuf,
+        /// Disk index file; created from the graph if missing.
+        #[arg(long)]
+        index: PathBuf,
+        #[arg(long, default_value_t = 80)]
+        ef: usize,
+        /// Beam width per query per round.
+        #[arg(long, default_value_t = 4)]
+        w: usize,
+        /// Comma-separated in-flight query counts to sweep.
+        #[arg(long, default_value = "1,8,16,32,64")]
+        concurrency: String,
+        /// Open the index with O_DIRECT.
+        #[arg(long, default_value_t = false)]
+        direct: bool,
+        /// Limit query count.
+        #[arg(long)]
+        queries: Option<usize>,
+        #[arg(long)]
+        csv: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -171,6 +203,9 @@ fn main() -> Result<()> {
             latency_queries,
             csv,
         }),
+        Cmd::Pipeline { data_dir, prefix, k, graph, index, ef, w, concurrency, direct, queries, csv } => {
+            pipeline_cmd(&data_dir, &prefix, k, &graph, &index, ef, w, &concurrency, direct, queries, csv.as_deref())
+        }
     }
 }
 
@@ -222,7 +257,7 @@ fn open_uring(_: &Path, _: bool, _: u32) -> Result<Box<dyn nvvec_io::BlockReader
 }
 
 fn disk_cmd(args: DiskArgs) -> Result<()> {
-    use nvvec_index::{DiskIndex, SearchScratch, VamanaGraph, write_disk_index};
+    use nvvec_index::{DiskIndex, SearchScratch};
     use rayon::prelude::*;
 
     let DiskArgs {
@@ -246,29 +281,7 @@ fn disk_cmd(args: DiskArgs) -> Result<()> {
     let csv = csv.as_deref();
 
     let ds = load(data_dir, prefix)?;
-    if !index_path.exists() {
-        if !graph_path.exists() {
-            bail!(
-                "graph cache {} not found — build it first with the vamana command",
-                graph_path.display()
-            );
-        }
-        let graph = VamanaGraph::load(graph_path).context("loading graph cache")?;
-        if graph.num_nodes() != ds.base.count {
-            bail!("graph has {} nodes, dataset has {}", graph.num_nodes(), ds.base.count);
-        }
-        let t = Instant::now();
-        let meta = write_disk_index(index_path, &ds.base, &graph).context("writing disk index")?;
-        let bytes = std::fs::metadata(index_path)?.len();
-        eprintln!(
-            "disk index written: {} ({:.1} MB, {} B/node, {}/block) in {:.1?}",
-            index_path.display(),
-            bytes as f64 / 1e6,
-            meta.node_len,
-            meta.nodes_per_block,
-            t.elapsed()
-        );
-    }
+    ensure_index(&ds, graph_path, index_path)?;
     let index = DiskIndex::with_reader(open_reader(&backend, index_path, direct, queue_depth)?)
         .context("opening disk index")?;
     if index.meta.n != ds.base.count as u64 {
@@ -485,6 +498,112 @@ fn vamana_cmd(args: VamanaArgs) -> Result<()> {
         println!("csv rows appended to {}", path.display());
     }
     Ok(())
+}
+
+/// Write the disk index from the graph cache if it doesn't exist yet.
+fn ensure_index(ds: &dataset::BenchDataset, graph_path: &Path, index_path: &Path) -> Result<()> {
+    use nvvec_index::{VamanaGraph, write_disk_index};
+    if index_path.exists() {
+        return Ok(());
+    }
+    if !graph_path.exists() {
+        bail!(
+            "graph cache {} not found — build it first with the vamana command",
+            graph_path.display()
+        );
+    }
+    let graph = VamanaGraph::load(graph_path).context("loading graph cache")?;
+    if graph.num_nodes() != ds.base.count {
+        bail!("graph has {} nodes, dataset has {}", graph.num_nodes(), ds.base.count);
+    }
+    let t = Instant::now();
+    let meta = write_disk_index(index_path, &ds.base, &graph).context("writing disk index")?;
+    let bytes = std::fs::metadata(index_path)?.len();
+    eprintln!(
+        "disk index written: {} ({:.1} MB, {} B/node, {}/block) in {:.1?}",
+        index_path.display(),
+        bytes as f64 / 1e6,
+        meta.node_len,
+        meta.nodes_per_block,
+        t.elapsed()
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pipeline_cmd(
+    data_dir: &Path,
+    prefix: &str,
+    k: usize,
+    graph_path: &Path,
+    index_path: &Path,
+    ef: usize,
+    w: usize,
+    concurrency: &str,
+    direct: bool,
+    queries: Option<usize>,
+    csv: Option<&Path>,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use nvvec_index::DiskIndex;
+        use nvvec_index::pipeline::{PipelineParams, search_pipelined};
+
+        let ds = load(data_dir, prefix)?;
+        if ef < k {
+            bail!("ef must be >= k");
+        }
+        ensure_index(&ds, graph_path, index_path)?;
+        let meta = DiskIndex::open(index_path).context("opening disk index")?.meta;
+        if meta.n != ds.base.count as u64 {
+            bail!("index has {} nodes, dataset has {}", meta.n, ds.base.count);
+        }
+
+        let nq = queries.unwrap_or(ds.queries.count).min(ds.queries.count);
+        let query_subset = ds.queries.head(nq);
+        let method = format!("pipeline-uring{}", if direct { "-direct" } else { "" });
+
+        for c in parse_efs(concurrency)? {
+            let opts = nvvec_io::UringOpts { queue_depth: (c * w).max(2) as u32, direct };
+            let mut exec = nvvec_io::UringExecutor::open(index_path, opts)?;
+            let t = Instant::now();
+            let out = search_pipelined(
+                &meta,
+                &mut exec,
+                &ds.base,
+                &query_subset,
+                &PipelineParams { k, ef, w, concurrency: c },
+            )?;
+            let secs = t.elapsed().as_secs_f64();
+            let qps = nq as f64 / secs;
+            let ids: Vec<Vec<u32>> =
+                out.iter().map(|(res, _)| res.iter().map(|&(_, id)| id).collect()).collect();
+            let recall = eval::recall_at_k(&ids, &ds.ground_truth, k);
+            let mean_reads = out.iter().map(|&(_, r)| r).sum::<usize>() as f64 / out.len() as f64;
+            let iops = mean_reads * qps;
+
+            println!(
+                "[{method}] c={c:3}  w={w}  ef={ef}  recall@{k}={recall:.4}  qps={qps:8.0}  reads={mean_reads:.0}  iops={iops:.0}  (1 thread)",
+            );
+            if let Some(path) = csv {
+                append_csv(
+                    path,
+                    &method,
+                    &format!("R{}-ef{ef}-w{w}-c{c}", meta.r),
+                    k,
+                    recall,
+                    qps,
+                    None,
+                )?;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (data_dir, prefix, k, graph_path, index_path, ef, w, concurrency, direct, queries, csv);
+        bail!("the pipeline command requires Linux (io_uring); run under WSL2 or Linux")
+    }
 }
 
 fn parse_efs(efs: &str) -> Result<Vec<usize>> {

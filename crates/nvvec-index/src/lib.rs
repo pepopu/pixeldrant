@@ -8,6 +8,8 @@
 pub mod build;
 pub mod disk;
 pub mod graph;
+#[cfg(target_os = "linux")]
+pub mod pipeline;
 pub mod search;
 
 pub use build::{BuildParams, build};

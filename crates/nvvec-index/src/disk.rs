@@ -213,7 +213,7 @@ impl<R: BlockReader> DiskIndex<R> {
     }
 }
 
-fn parse_neighbors(node_bytes: &[u8], dim: usize, r: usize) -> Vec<u32> {
+pub(crate) fn parse_neighbors(node_bytes: &[u8], dim: usize, r: usize) -> Vec<u32> {
     let deg_off = dim * 4;
     let deg =
         u32::from_le_bytes(node_bytes[deg_off..deg_off + 4].try_into().unwrap()) as usize;

@@ -197,6 +197,133 @@ impl BlockReader for UringReader {
     }
 }
 
+/// Lower-level asynchronous interface for the cross-query pipeline (M3b):
+/// stage reads from many query state machines, flush them with one syscall,
+/// and drain completions as they arrive — the ring never goes shallow just
+/// because one query is between rounds.
+///
+/// Single-threaded by design (no locking): one executor per scheduler
+/// thread. `user_data` layout: high 16 bits = buffer slot, low 48 = caller
+/// tag. After an I/O error the executor must be discarded — in-flight slots
+/// are not recovered.
+pub struct UringExecutor {
+    file: File,
+    ring: IoUring,
+    bufs: AlignedBufs,
+    free: Vec<u16>,
+    cq_buf: Vec<(u64, i32)>,
+    num_blocks: u64,
+}
+
+const TAG_MASK: u64 = (1 << 48) - 1;
+
+impl UringExecutor {
+    pub fn open(path: &Path, opts: UringOpts) -> io::Result<Self> {
+        assert!(opts.queue_depth > 0 && opts.queue_depth <= u16::MAX as u32);
+        let mut oo = std::fs::OpenOptions::new();
+        oo.read(true);
+        if opts.direct {
+            oo.custom_flags(libc::O_DIRECT);
+        }
+        let file = oo.open(path)?;
+        let len = file.metadata()?.len();
+        if !len.is_multiple_of(BLOCK_SIZE as u64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: size {len} is not a multiple of block size {BLOCK_SIZE}", path.display()),
+            ));
+        }
+        Ok(Self {
+            file,
+            ring: IoUring::new(opts.queue_depth)?,
+            bufs: AlignedBufs::new(opts.queue_depth as usize),
+            free: (0..opts.queue_depth as u16).rev().collect(),
+            cq_buf: Vec::new(),
+            num_blocks: len / BLOCK_SIZE as u64,
+        })
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.bufs.blocks
+    }
+
+    pub fn free_slots(&self) -> usize {
+        self.free.len()
+    }
+
+    pub fn num_blocks(&self) -> u64 {
+        self.num_blocks
+    }
+
+    /// Stage one block read tagged with `tag` (< 2^48). Requires a free
+    /// slot — size the queue depth to `concurrency * beam_width` so this
+    /// never fails in the scheduler's steady state.
+    pub fn stage_read(&mut self, block_id: u64, tag: u64) -> io::Result<()> {
+        if block_id >= self.num_blocks {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("block {block_id} out of range ({} blocks)", self.num_blocks),
+            ));
+        }
+        if tag > TAG_MASK {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "tag exceeds 48 bits"));
+        }
+        let Some(slot) = self.free.pop() else {
+            return Err(io::Error::other("no free buffer slot (queue depth too small)"));
+        };
+        let sqe = opcode::Read::new(
+            types::Fd(self.file.as_raw_fd()),
+            self.bufs.slot_ptr(slot as usize),
+            BLOCK_SIZE as u32,
+        )
+        .offset(block_id * BLOCK_SIZE as u64)
+        .build()
+        .user_data(((slot as u64) << 48) | tag);
+        // SAFETY: the slot buffer stays allocated until the completion is
+        // drained; slots are only recycled in drain().
+        unsafe {
+            self.ring.submission().push(&sqe).map_err(|_| {
+                io::Error::other("submission queue full (stage/flush imbalance)")
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Submit everything staged since the last flush (one syscall).
+    pub fn flush(&mut self) -> io::Result<usize> {
+        self.ring.submit()
+    }
+
+    /// Wait for at least `min` completions (0 = poll only), then invoke
+    /// `f(tag, block_bytes)` for every available completion. Slots are
+    /// recycled after each callback. Returns completions processed.
+    pub fn drain(&mut self, min: usize, mut f: impl FnMut(u64, &[u8])) -> io::Result<usize> {
+        if min > 0 {
+            self.ring.submit_and_wait(min)?;
+        }
+        let Self { ring, cq_buf, bufs, free, .. } = self;
+        cq_buf.clear();
+        for cqe in ring.completion() {
+            cq_buf.push((cqe.user_data(), cqe.result()));
+        }
+        for &(user_data, result) in cq_buf.iter() {
+            if result < 0 {
+                return Err(io::Error::from_raw_os_error(-result));
+            }
+            if result as usize != BLOCK_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("short read: {result} of {BLOCK_SIZE} bytes"),
+                ));
+            }
+            let slot = (user_data >> 48) as u16;
+            f(user_data & TAG_MASK, bufs.slot(slot as usize));
+            free.push(slot);
+        }
+        Ok(cq_buf.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +390,35 @@ mod tests {
         let uring = UringReader::open(&path, UringOpts::default()).unwrap();
         let mut buf = vec![0u8; BLOCK_SIZE];
         assert!(uring.read_block(4, &mut buf).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn executor_stage_flush_drain() {
+        let path = patterned_file("exec", 32);
+        let mut exec =
+            UringExecutor::open(&path, UringOpts { queue_depth: 8, direct: false }).unwrap();
+        assert_eq!(exec.capacity(), 8);
+
+        // two waves of interleaved reads, tags identify the block
+        let mut seen = Vec::new();
+        for wave in 0..2u64 {
+            for i in 0..8u64 {
+                let block = (wave * 8 + i) * 2 % 32;
+                exec.stage_read(block, block).unwrap();
+            }
+            assert_eq!(exec.free_slots(), 0);
+            exec.flush().unwrap();
+            let drained = exec
+                .drain(8, |tag, bytes| {
+                    assert!(bytes.iter().all(|&b| b == (tag % 251) as u8), "block {tag}");
+                    seen.push(tag);
+                })
+                .unwrap();
+            assert_eq!(drained, 8);
+            assert_eq!(exec.free_slots(), 8);
+        }
+        assert_eq!(seen.len(), 16);
         std::fs::remove_file(&path).ok();
     }
 }
