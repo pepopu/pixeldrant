@@ -1,0 +1,5 @@
+# Benchmarks are only meaningful with the host CPU's full SIMD ISA.
+# Distance kernels rely on auto-vectorization under this flag (see
+# crates/nvvec-core/src/distance.rs) before we commit to hand-written SIMD.
+[build]
+rustflags = ["-C", "target-cpu=native"]

@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/nvvec-core",
+    "crates/nvvec-io",
+    "crates/nvvec-bench",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+nvvec-core = { path = "crates/nvvec-core" }
+nvvec-io = { path = "crates/nvvec-io" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+
+[profile.release]
+# Keep symbols for profiling; this project lives and dies by flamegraphs.
+debug = true
+lto = "thin"
+codegen-units = 1
