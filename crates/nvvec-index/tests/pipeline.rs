@@ -4,6 +4,7 @@
 #![cfg(target_os = "linux")]
 
 use nvvec_core::dataset::FloatVectors;
+use nvvec_core::scorer::RouteScorer;
 use nvvec_index::pipeline::{PipelineParams, search_pipelined};
 use nvvec_index::{BuildParams, DiskIndex, SearchScratch, build, write_disk_index};
 use nvvec_io::{UringExecutor, UringOpts};
@@ -67,6 +68,58 @@ fn pipelined_matches_batched_search() {
         assert_eq!(got_res, exp_res, "query {qi}: results diverged");
     }
 
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn sq8_routing_with_exact_rerank_holds_recall() {
+    use nvvec_core::distance::l2_sq;
+    use nvvec_index::Sq8Codebook;
+
+    let (n, dim, k, ef, w, c) = (1500, 24, 10, 50, 2, 8);
+    let base = random_vectors(n, dim, 51);
+    let queries = random_vectors(100, dim, 52);
+    let graph = build(&base, &BuildParams { r: 16, l_build: 40, alpha: 1.2 });
+    let path = std::env::temp_dir().join(format!("nvvec-pipe-sq8-{}", std::process::id()));
+    write_disk_index(&path, &base, &graph).unwrap();
+    let meta = DiskIndex::open(&path).unwrap().meta;
+    let exact_gt = nvvec_core::brute::search(&base, &queries, k);
+
+    let mut recalls = Vec::new();
+    let codebook = Sq8Codebook::train(&base);
+    assert!(codebook.memory_bytes() * 3 < base.count * base.dim * 4);
+
+    // run once with exact routing, once with sq8 routing
+    for use_sq8 in [false, true] {
+        let mut exec = UringExecutor::open(
+            &path,
+            UringOpts { queue_depth: (c * w) as u32, direct: false },
+        )
+        .unwrap();
+        let params = PipelineParams { k, ef, w, concurrency: c };
+        let out = if use_sq8 {
+            search_pipelined(&meta, &mut exec, &codebook, &queries, &params).unwrap()
+        } else {
+            search_pipelined(&meta, &mut exec, &base, &queries, &params).unwrap()
+        };
+
+        let mut hits = 0;
+        for (qi, (res, _)) in out.iter().enumerate() {
+            // returned distances must be EXACT regardless of routing scorer
+            for &(dist, id) in res {
+                let true_dist = l2_sq(queries.get(qi), base.get(id as usize));
+                assert_eq!(dist, true_dist, "query {qi} id {id}: rerank not exact");
+            }
+            let truth: Vec<u32> = exact_gt[qi].iter().map(|&(_, id)| id).collect();
+            hits += res.iter().filter(|(_, id)| truth.contains(id)).count();
+        }
+        recalls.push(hits as f64 / (out.len() * k) as f64);
+    }
+    let (exact_recall, sq8_recall) = (recalls[0], recalls[1]);
+    assert!(
+        sq8_recall >= exact_recall - 0.03,
+        "sq8 routing lost too much recall: {sq8_recall} vs {exact_recall}"
+    );
     std::fs::remove_file(&path).ok();
 }
 

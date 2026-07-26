@@ -10,9 +10,11 @@ pub mod disk;
 pub mod graph;
 #[cfg(target_os = "linux")]
 pub mod pipeline;
+pub mod quant;
 pub mod search;
 
 pub use build::{BuildParams, build};
 pub use disk::{DiskIndex, DiskIndexMeta, write_disk_index};
 pub use graph::VamanaGraph;
+pub use quant::Sq8Codebook;
 pub use search::{SearchScratch, beam_search, beam_search_batched};

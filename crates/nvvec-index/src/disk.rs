@@ -213,6 +213,21 @@ impl<R: BlockReader> DiskIndex<R> {
     }
 }
 
+/// Decode the little-endian f32 vector at the head of a node's bytes into a
+/// reusable buffer. Rerank then calls the ordinary `l2_sq` on it — same
+/// kernel, same summation order, bit-identical to RAM-based scoring.
+/// (Only the Linux pipeline uses it today; gate follows the caller.)
+#[cfg(target_os = "linux")]
+#[inline]
+pub(crate) fn decode_vector(node_bytes: &[u8], dim: usize, out: &mut Vec<f32>) {
+    out.clear();
+    out.extend(
+        node_bytes[..dim * 4]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())),
+    );
+}
+
 pub(crate) fn parse_neighbors(node_bytes: &[u8], dim: usize, r: usize) -> Vec<u32> {
     let deg_off = dim * 4;
     let deg =

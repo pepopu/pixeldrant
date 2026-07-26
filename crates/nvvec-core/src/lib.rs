@@ -5,4 +5,5 @@ pub mod brute;
 pub mod dataset;
 pub mod distance;
 pub mod eval;
+pub mod scorer;
 pub mod topk;
