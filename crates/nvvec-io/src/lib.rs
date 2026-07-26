@@ -18,6 +18,11 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
+pub mod uring;
+#[cfg(target_os = "linux")]
+pub use uring::{UringOpts, UringReader};
+
 /// Block size in bytes. 4 KiB matches both NVMe atomic read granularity and
 /// the DiskANN node layout (vector + neighbor list packed in one block).
 pub const BLOCK_SIZE: usize = 4096;
@@ -40,6 +45,20 @@ pub trait BlockReader: Send + Sync {
             self.read_block(r.block_id, r.buf)?;
         }
         Ok(())
+    }
+}
+
+impl<T: BlockReader + ?Sized> BlockReader for Box<T> {
+    fn num_blocks(&self) -> u64 {
+        (**self).num_blocks()
+    }
+
+    fn read_block(&self, block_id: u64, buf: &mut [u8]) -> io::Result<()> {
+        (**self).read_block(block_id, buf)
+    }
+
+    fn read_batch(&self, batch: &mut [BlockRead<'_>]) -> io::Result<()> {
+        (**self).read_batch(batch)
     }
 }
 

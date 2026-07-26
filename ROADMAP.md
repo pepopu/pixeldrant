@@ -36,8 +36,13 @@
   Linux 验证(2026-07-27,阿里云 2C/3.6G/高效云盘):11 测试全绿;冷盘 29 QPS
   = 盘 2.2k IOPS ÷ 86 读,**QPS = IOPS ÷ reads 公式精确成立** → NVMe 1M IOPS
   推算 ~11.6k QPS @ recall 0.95,这就是 M3/M6 的靶子
-- [ ] **M3 io_uring 异步流水线**(3-4 周,核心):O_DIRECT + 注册 buffer +
-  跨查询共享队列。Go/No-Go:IOPS 利用率 ≥60%,QPS ≥ 同步版 5×。**需要 Linux 裸机**
+- [ ] **M3 io_uring 异步流水线**(核心):
+  - [x] **M3a 单查询批量后端**:`UringReader`(每线程独立 ring、整批 frontier 一次
+    提交、4KB 对齐缓冲池、可选 O_DIRECT)。WSL2 验证(2026-07-27):正确性与 pread
+    逐位一致;O_DIRECT 下 w=1→8 吞吐 **5.8×**(295→1705 QPS),W 摊薄 I/O 延迟的
+    机制成立;w=8→16 触及 WSL 虚拟盘并行度上限
+  - [ ] **M3b 跨查询流水线**:单线程驱动 N 个查询状态机共享深队列 ring——打满设备
+    IOPS 的关键。Go/No-Go(需真 NVMe):IOPS 利用率 ≥60%,QPS ≥ 同步版 5×
 - [ ] **M4 量化粗筛**(2-3 周):SQ8 → RaBitQ 码本驻留内存。
   验证:内存 ≤ 原始 1/10,recall 损失 ≤1pt
 - [ ] **M5 工程化**(3-4 周):热点缓存、超内存建图、只读索引原子发布、最小 HTTP API

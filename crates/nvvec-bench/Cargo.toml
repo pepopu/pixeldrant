@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 nvvec-core = { workspace = true }
 nvvec-index = { workspace = true }
+nvvec-io = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 rayon = { workspace = true }

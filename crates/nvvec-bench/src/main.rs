@@ -91,6 +91,15 @@ enum Cmd {
         /// Comma-separated ef values.
         #[arg(long, default_value = "40,60,80,120,200")]
         efs: String,
+        /// I/O backend: pread (portable sync) or uring (Linux io_uring).
+        #[arg(long, default_value = "pread")]
+        backend: String,
+        /// Open the index with O_DIRECT (uring backend, Linux only).
+        #[arg(long, default_value_t = false)]
+        direct: bool,
+        /// io_uring queue depth.
+        #[arg(long, default_value_t = 128)]
+        queue_depth: u32,
         /// Comma-separated beam widths (blocks read per I/O round).
         #[arg(long, default_value = "1,4,8")]
         ws: String,
@@ -133,27 +142,108 @@ fn main() -> Result<()> {
             latency_queries,
             csv,
         }),
-        Cmd::Disk { data_dir, prefix, k, graph, index, efs, ws, queries, latency_queries, csv } => {
-            disk_cmd(&data_dir, &prefix, k, &graph, &index, &efs, &ws, queries, latency_queries, csv.as_deref())
-        }
+        Cmd::Disk {
+            data_dir,
+            prefix,
+            k,
+            graph,
+            index,
+            backend,
+            direct,
+            queue_depth,
+            efs,
+            ws,
+            queries,
+            latency_queries,
+            csv,
+        } => disk_cmd(DiskArgs {
+            data_dir,
+            prefix,
+            k,
+            graph,
+            index,
+            backend,
+            direct,
+            queue_depth,
+            efs,
+            ws,
+            queries,
+            latency_queries,
+            csv,
+        }),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn disk_cmd(
-    data_dir: &Path,
-    prefix: &str,
+struct DiskArgs {
+    data_dir: PathBuf,
+    prefix: String,
     k: usize,
-    graph_path: &Path,
-    index_path: &Path,
-    efs: &str,
-    ws: &str,
+    graph: PathBuf,
+    index: PathBuf,
+    backend: String,
+    direct: bool,
+    queue_depth: u32,
+    efs: String,
+    ws: String,
     queries: Option<usize>,
     latency_queries: usize,
-    csv: Option<&Path>,
-) -> Result<()> {
+    csv: Option<PathBuf>,
+}
+
+/// Open the chosen I/O backend. Each call returns a fresh reader so callers
+/// can hold one per thread (the uring backend wants an uncontended ring).
+fn open_reader(
+    backend: &str,
+    path: &Path,
+    direct: bool,
+    queue_depth: u32,
+) -> Result<Box<dyn nvvec_io::BlockReader>> {
+    match backend {
+        "pread" => {
+            if direct {
+                bail!("--direct is only supported by the uring backend");
+            }
+            Ok(Box::new(nvvec_io::PreadReader::open(path)?))
+        }
+        "uring" => open_uring(path, direct, queue_depth),
+        other => bail!("unknown backend '{other}' (expected pread or uring)"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_uring(path: &Path, direct: bool, queue_depth: u32) -> Result<Box<dyn nvvec_io::BlockReader>> {
+    let opts = nvvec_io::UringOpts { queue_depth, direct };
+    Ok(Box::new(nvvec_io::UringReader::open(path, opts)?))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_uring(_: &Path, _: bool, _: u32) -> Result<Box<dyn nvvec_io::BlockReader>> {
+    bail!("the uring backend is Linux-only; run under WSL2 or Linux")
+}
+
+fn disk_cmd(args: DiskArgs) -> Result<()> {
     use nvvec_index::{DiskIndex, SearchScratch, VamanaGraph, write_disk_index};
     use rayon::prelude::*;
+
+    let DiskArgs {
+        data_dir,
+        prefix,
+        k,
+        graph: graph_path,
+        index: index_path,
+        backend,
+        direct,
+        queue_depth,
+        efs,
+        ws,
+        queries,
+        latency_queries,
+        csv,
+    } = args;
+    let (data_dir, prefix) = (data_dir.as_path(), prefix.as_str());
+    let (graph_path, index_path) = (graph_path.as_path(), index_path.as_path());
+    let (efs, ws) = (efs.as_str(), ws.as_str());
+    let csv = csv.as_deref();
 
     let ds = load(data_dir, prefix)?;
     if !index_path.exists() {
@@ -179,11 +269,13 @@ fn disk_cmd(
             t.elapsed()
         );
     }
-    let index = DiskIndex::open(index_path).context("opening disk index")?;
+    let index = DiskIndex::with_reader(open_reader(&backend, index_path, direct, queue_depth)?)
+        .context("opening disk index")?;
     if index.meta.n != ds.base.count as u64 {
         bail!("index has {} nodes, dataset has {}", index.meta.n, ds.base.count);
     }
 
+    let method = format!("disk-{backend}{}", if direct { "-direct" } else { "" });
     let params_tag = format!("R{}", index.meta.r);
     let nq = queries.unwrap_or(ds.queries.count).min(ds.queries.count);
     let query_subset = ds.queries.head(nq);
@@ -197,12 +289,19 @@ fn disk_cmd(
                 .collect::<Vec<_>>()
                 .par_chunks(64)
                 .map_init(
-                    || (SearchScratch::new(ds.base.count), Vec::new()),
-                    |(scratch, io_bufs), chunk| {
+                    // per-thread reader: the uring backend wants an
+                    // uncontended ring per thread
+                    || {
+                        let reader = open_reader(&backend, index_path, direct, queue_depth)
+                            .expect("open backend");
+                        let idx = DiskIndex::with_reader(reader).expect("open index");
+                        (idx, SearchScratch::new(ds.base.count), Vec::new())
+                    },
+                    |(thread_index, scratch, io_bufs), chunk| {
                         chunk
                             .iter()
                             .map(|&qi| {
-                                let (res, reads) = index
+                                let (res, reads) = thread_index
                                     .search(&ds.base, query_subset.get(qi), k, ef, w, scratch, io_bufs)
                                     .expect("disk read failed");
                                 (res.into_iter().map(|(_, id)| id).collect::<Vec<u32>>(), reads)
@@ -231,14 +330,14 @@ fn disk_cmd(
             let lat = eval::latency_stats(samples);
 
             println!(
-                "w={w}  ef={ef:4}  recall@{k}={recall:.4}  qps={qps:8.0}  p50={:6.0}us  p99={:6.0}us  reads={mean_reads:.0}",
+                "[{method}] w={w}  ef={ef:4}  recall@{k}={recall:.4}  qps={qps:8.0}  p50={:6.0}us  p99={:6.0}us  reads={mean_reads:.0}",
                 lat.p50_us, lat.p99_us
             );
             if let Some(path) = csv {
                 append_csv(
                     path,
-                    "disk-pread",
-                    &format!("{params_tag}-ef{ef}-w{w}"),
+                    &method,
+                    &format!("{params_tag}-ef{ef}-w{w}-qd{queue_depth}"),
                     k,
                     recall,
                     qps,
