@@ -65,6 +65,71 @@ impl SearchScratch {
     }
 }
 
+/// Round-based beam search with width `w`: each round expands the up-to-`w`
+/// closest unexpanded candidates at once. `expand` receives the whole
+/// frontier and must APPEND all their neighbors to the buffer — for the disk
+/// index that is one batched read of `w` blocks, which is exactly the shape
+/// the io_uring backend (M3) wants submitted together.
+///
+/// With `w == 1` this is step-for-step identical to [`beam_search`].
+/// Returns the number of expanded nodes (= block reads for the disk index).
+pub fn beam_search_batched(
+    base: &FloatVectors,
+    query: &[f32],
+    entry: u32,
+    ef: usize,
+    w: usize,
+    mut expand: impl FnMut(&[u32], &mut Vec<u32>),
+    scratch: &mut SearchScratch,
+) -> usize {
+    assert!(ef > 0 && w > 0);
+    scratch.begin();
+    scratch.first_visit(entry);
+    let d0 = l2_sq(query, base.get(entry as usize));
+    scratch.pool.push(Candidate { dist: d0, id: entry, expanded: false });
+
+    let mut expansions = 0usize;
+    let mut frontier: Vec<u32> = Vec::with_capacity(w);
+    loop {
+        frontier.clear();
+        let lim = scratch.pool.len().min(ef);
+        for i in 0..lim {
+            if frontier.len() == w {
+                break;
+            }
+            if !scratch.pool[i].expanded {
+                scratch.pool[i].expanded = true;
+                scratch.expanded.push((scratch.pool[i].dist, scratch.pool[i].id));
+                frontier.push(scratch.pool[i].id);
+            }
+        }
+        if frontier.is_empty() {
+            break;
+        }
+        expansions += frontier.len();
+
+        let mut nb_buf = std::mem::take(&mut scratch.nb_buf);
+        nb_buf.clear();
+        expand(&frontier, &mut nb_buf);
+        for i in 0..nb_buf.len() {
+            let nb = nb_buf[i];
+            if !scratch.first_visit(nb) {
+                continue;
+            }
+            let d = l2_sq(query, base.get(nb as usize));
+            if scratch.pool.len() < ef || d < scratch.pool.last().unwrap().dist {
+                let pos = scratch.pool.partition_point(|c| c.dist <= d);
+                scratch.pool.insert(pos, Candidate { dist: d, id: nb, expanded: false });
+                if scratch.pool.len() > ef {
+                    scratch.pool.pop();
+                }
+            }
+        }
+        scratch.nb_buf = nb_buf;
+    }
+    expansions
+}
+
 /// Greedy best-first search keeping the `ef` closest candidates seen.
 /// `neighbors` must fill the provided buffer with the adjacency of a node.
 /// Results are left in the scratch (see [`SearchScratch::top_k`]);

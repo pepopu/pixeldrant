@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 nvvec-core = { workspace = true }
+nvvec-io = { workspace = true }
 parking_lot = { workspace = true }
 rayon = { workspace = true }

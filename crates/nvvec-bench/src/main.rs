@@ -73,6 +73,35 @@ enum Cmd {
         #[arg(long)]
         csv: Option<PathBuf>,
     },
+    /// On-disk index (M2): pack vectors+graph into 4 KiB blocks, search via
+    /// the BlockReader backend, sweep ef and beam width w.
+    Disk {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long, default_value = "sift")]
+        prefix: String,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Graph cache produced by the vamana command (required).
+        #[arg(long)]
+        graph: PathBuf,
+        /// Disk index file; created from the graph if missing.
+        #[arg(long)]
+        index: PathBuf,
+        /// Comma-separated ef values.
+        #[arg(long, default_value = "40,60,80,120,200")]
+        efs: String,
+        /// Comma-separated beam widths (blocks read per I/O round).
+        #[arg(long, default_value = "1,4,8")]
+        ws: String,
+        /// Limit query count (slow/cold disks can't take the full 10k).
+        #[arg(long)]
+        queries: Option<usize>,
+        #[arg(long, default_value_t = 1000)]
+        latency_queries: usize,
+        #[arg(long)]
+        csv: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -104,7 +133,121 @@ fn main() -> Result<()> {
             latency_queries,
             csv,
         }),
+        Cmd::Disk { data_dir, prefix, k, graph, index, efs, ws, queries, latency_queries, csv } => {
+            disk_cmd(&data_dir, &prefix, k, &graph, &index, &efs, &ws, queries, latency_queries, csv.as_deref())
+        }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn disk_cmd(
+    data_dir: &Path,
+    prefix: &str,
+    k: usize,
+    graph_path: &Path,
+    index_path: &Path,
+    efs: &str,
+    ws: &str,
+    queries: Option<usize>,
+    latency_queries: usize,
+    csv: Option<&Path>,
+) -> Result<()> {
+    use nvvec_index::{DiskIndex, SearchScratch, VamanaGraph, write_disk_index};
+    use rayon::prelude::*;
+
+    let ds = load(data_dir, prefix)?;
+    if !index_path.exists() {
+        if !graph_path.exists() {
+            bail!(
+                "graph cache {} not found — build it first with the vamana command",
+                graph_path.display()
+            );
+        }
+        let graph = VamanaGraph::load(graph_path).context("loading graph cache")?;
+        if graph.num_nodes() != ds.base.count {
+            bail!("graph has {} nodes, dataset has {}", graph.num_nodes(), ds.base.count);
+        }
+        let t = Instant::now();
+        let meta = write_disk_index(index_path, &ds.base, &graph).context("writing disk index")?;
+        let bytes = std::fs::metadata(index_path)?.len();
+        eprintln!(
+            "disk index written: {} ({:.1} MB, {} B/node, {}/block) in {:.1?}",
+            index_path.display(),
+            bytes as f64 / 1e6,
+            meta.node_len,
+            meta.nodes_per_block,
+            t.elapsed()
+        );
+    }
+    let index = DiskIndex::open(index_path).context("opening disk index")?;
+    if index.meta.n != ds.base.count as u64 {
+        bail!("index has {} nodes, dataset has {}", index.meta.n, ds.base.count);
+    }
+
+    let params_tag = format!("R{}", index.meta.r);
+    let nq = queries.unwrap_or(ds.queries.count).min(ds.queries.count);
+    let query_subset = ds.queries.head(nq);
+    for w in parse_efs(ws)? {
+        for ef in parse_efs(efs)? {
+            if ef < k {
+                continue;
+            }
+            let t = Instant::now();
+            let out: Vec<(Vec<u32>, usize)> = (0..nq)
+                .collect::<Vec<_>>()
+                .par_chunks(64)
+                .map_init(
+                    || (SearchScratch::new(ds.base.count), Vec::new()),
+                    |(scratch, io_bufs), chunk| {
+                        chunk
+                            .iter()
+                            .map(|&qi| {
+                                let (res, reads) = index
+                                    .search(&ds.base, query_subset.get(qi), k, ef, w, scratch, io_bufs)
+                                    .expect("disk read failed");
+                                (res.into_iter().map(|(_, id)| id).collect::<Vec<u32>>(), reads)
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                )
+                .flatten()
+                .collect();
+            let qps = nq as f64 / t.elapsed().as_secs_f64();
+            let ids: Vec<Vec<u32>> = out.iter().map(|(ids, _)| ids.clone()).collect();
+            let mean_reads =
+                out.iter().map(|&(_, r)| r).sum::<usize>() as f64 / out.len() as f64;
+            let recall = eval::recall_at_k(&ids, &ds.ground_truth, k);
+
+            let mut scratch = SearchScratch::new(ds.base.count);
+            let mut io_bufs = Vec::new();
+            let mut samples = Vec::with_capacity(latency_queries.min(nq));
+            for qi in 0..latency_queries.min(nq) {
+                let t = Instant::now();
+                index
+                    .search(&ds.base, query_subset.get(qi), k, ef, w, &mut scratch, &mut io_bufs)
+                    .expect("disk read failed");
+                samples.push(t.elapsed().as_secs_f64() * 1e6);
+            }
+            let lat = eval::latency_stats(samples);
+
+            println!(
+                "w={w}  ef={ef:4}  recall@{k}={recall:.4}  qps={qps:8.0}  p50={:6.0}us  p99={:6.0}us  reads={mean_reads:.0}",
+                lat.p50_us, lat.p99_us
+            );
+            if let Some(path) = csv {
+                append_csv(
+                    path,
+                    "disk-pread",
+                    &format!("{params_tag}-ef{ef}-w{w}"),
+                    k,
+                    recall,
+                    qps,
+                    Some(&lat),
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 struct VamanaArgs {

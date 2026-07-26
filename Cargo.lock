@@ -197,6 +197,7 @@ name = "nvvec-index"
 version = "0.0.1"
 dependencies = [
  "nvvec-core",
+ "nvvec-io",
  "parking_lot",
  "rayon",
 ]

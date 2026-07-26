@@ -28,8 +28,14 @@
   Go/No-Go 通过:recall@10=0.955 时 **24.6k QPS**(目标 13k 的 189%),
   召回-QPS 曲线与 usearch 重合(0.97 召回档:16.7k vs 16.3k)。
   M2 关键数据:ef=80 时平均 86 跳 → 磁盘版每查询 ~86 次块读
-- [ ] **M2 磁盘布局 + 同步 I/O**(2 周):4KB 节点块格式定稿,pread 版磁盘搜索。
-  验证:I/O 次数 ≈ beam 步数 × W,recall 与内存版一致
+- [x] **M2 磁盘布局 + 同步 I/O**:4KB 块格式定稿(节点=向量+度数+邻居,SIFT 644B/节点、
+  6 节点/块,索引 683MB/3s 写出),pread 版分轮束搜索(束宽 W,批量读接口)。
+  验收通过:**W=1 与内存版逐位等价**(recall 全档一致),**reads == hops 精确成立**
+  (ef=80:86 次读);W=4 多 ~10 读换小幅召回提升,是 M3 流水线甜点位。
+  同步 syscall 代价:QPS 24.6k(内存)→ 1.3k(页缓存热磁盘,ef=80)——M3 的攻击目标。
+  Linux 验证(2026-07-27,阿里云 2C/3.6G/高效云盘):11 测试全绿;冷盘 29 QPS
+  = 盘 2.2k IOPS ÷ 86 读,**QPS = IOPS ÷ reads 公式精确成立** → NVMe 1M IOPS
+  推算 ~11.6k QPS @ recall 0.95,这就是 M3/M6 的靶子
 - [ ] **M3 io_uring 异步流水线**(3-4 周,核心):O_DIRECT + 注册 buffer +
   跨查询共享队列。Go/No-Go:IOPS 利用率 ≥60%,QPS ≥ 同步版 5×。**需要 Linux 裸机**
 - [ ] **M4 量化粗筛**(2-3 周):SQ8 → RaBitQ 码本驻留内存。
@@ -47,5 +53,8 @@ DiskANN (NeurIPS'19) / RaBitQ (SIGMOD'24) / Starling (SIGMOD'24) / SPANN (NeurIP
 ## 环境备注
 
 - 开发与正确性:Windows/任意平台均可(pread 后端);
-- M3 起的性能数字:必须 Linux 裸机 NVMe(WSL2 虚拟盘数字无效),届时装双系统或租
-  Hetzner/AWS i4i。
+- 云服务器 118.31.47.25(阿里云,CentOS 7 内核 3.10,2C/3.6G,高效云盘 2.2k IOPS
+  封顶):已配免密 SSH + Rust 工具链,代码在 /root/nvvec。定位:Linux 正确性平台。
+  **不能跑 M3**——无 io_uring(内核太老)且盘 2 线程即饱和;
+- M3 起的性能数字:必须本地 NVMe 的 Linux(WSL2 虚拟盘数字无效),推荐阿里云
+  i 系列按量实例(跑基准时开机)或 Hetzner/AWS i4i。

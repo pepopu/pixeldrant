@@ -6,9 +6,11 @@
 //! adjacency as a closure instead of a concrete graph type.
 
 pub mod build;
+pub mod disk;
 pub mod graph;
 pub mod search;
 
 pub use build::{BuildParams, build};
+pub use disk::{DiskIndex, DiskIndexMeta, write_disk_index};
 pub use graph::VamanaGraph;
-pub use search::{SearchScratch, beam_search};
+pub use search::{SearchScratch, beam_search, beam_search_batched};
