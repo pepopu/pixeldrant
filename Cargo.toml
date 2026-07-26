@@ -5,6 +5,7 @@ members = [
     "crates/nvvec-index",
     "crates/nvvec-io",
     "crates/nvvec-bench",
+    "crates/nvvec-server",
 ]
 
 [workspace.package]
@@ -17,9 +18,13 @@ nvvec-core = { path = "crates/nvvec-core" }
 nvvec-index = { path = "crates/nvvec-index" }
 nvvec-io = { path = "crates/nvvec-io" }
 anyhow = "1"
+axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 parking_lot = "0.12"
 rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
 
 [profile.release]
 # Keep symbols for profiling; this project lives and dies by flamegraphs.

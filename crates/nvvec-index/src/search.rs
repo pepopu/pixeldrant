@@ -6,6 +6,7 @@
 
 use nvvec_core::dataset::FloatVectors;
 use nvvec_core::distance::l2_sq;
+use nvvec_core::scorer::RouteScorer;
 
 #[derive(Clone, Copy)]
 struct Candidate {
@@ -71,10 +72,12 @@ impl SearchScratch {
 /// index that is one batched read of `w` blocks, which is exactly the shape
 /// the io_uring backend (M3) wants submitted together.
 ///
-/// With `w == 1` this is step-for-step identical to [`beam_search`].
+/// Routing distances come from `scorer` (exact `FloatVectors` or a
+/// quantized codebook). With `w == 1` and an exact scorer this is
+/// step-for-step identical to [`beam_search`].
 /// Returns the number of expanded nodes (= block reads for the disk index).
-pub fn beam_search_batched(
-    base: &FloatVectors,
+pub fn beam_search_batched<S: RouteScorer>(
+    scorer: &S,
     query: &[f32],
     entry: u32,
     ef: usize,
@@ -85,7 +88,7 @@ pub fn beam_search_batched(
     assert!(ef > 0 && w > 0);
     scratch.begin();
     scratch.first_visit(entry);
-    let d0 = l2_sq(query, base.get(entry as usize));
+    let d0 = scorer.score(query, entry);
     scratch.pool.push(Candidate { dist: d0, id: entry, expanded: false });
 
     let mut expansions = 0usize;
@@ -116,7 +119,7 @@ pub fn beam_search_batched(
             if !scratch.first_visit(nb) {
                 continue;
             }
-            let d = l2_sq(query, base.get(nb as usize));
+            let d = scorer.score(query, nb);
             if scratch.pool.len() < ef || d < scratch.pool.last().unwrap().dist {
                 let pos = scratch.pool.partition_point(|c| c.dist <= d);
                 scratch.pool.insert(pos, Candidate { dist: d, id: nb, expanded: false });

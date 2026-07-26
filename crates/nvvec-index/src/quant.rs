@@ -64,6 +64,48 @@ impl Sq8Codebook {
     }
 }
 
+const MAGIC: &[u8; 4] = b"NVQ8";
+
+impl Sq8Codebook {
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+        w.write_all(MAGIC)?;
+        w.write_all(&(self.dim as u32).to_le_bytes())?;
+        w.write_all(&(self.count as u64).to_le_bytes())?;
+        for x in self.min.iter().chain(&self.scale) {
+            w.write_all(&x.to_le_bytes())?;
+        }
+        w.write_all(&self.codes)?;
+        w.flush()
+    }
+
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Read;
+        let err = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+        let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
+        let mut header = [0u8; 16];
+        r.read_exact(&mut header)?;
+        if &header[..4] != MAGIC {
+            return Err(err("not an sq8 codebook"));
+        }
+        let dim = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        let count = u64::from_le_bytes(header[8..16].try_into().unwrap()) as usize;
+        if dim == 0 || dim > 65_536 {
+            return Err(err("corrupt codebook header"));
+        }
+        let mut floats = vec![0u8; dim * 8];
+        r.read_exact(&mut floats)?;
+        let decode =
+            |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() };
+        let min = decode(&floats[..dim * 4]);
+        let scale = decode(&floats[dim * 4..]);
+        let mut codes = vec![0u8; count * dim];
+        r.read_exact(&mut codes)?;
+        Ok(Self { dim, count, min, scale, codes })
+    }
+}
+
 impl RouteScorer for Sq8Codebook {
     #[inline]
     fn score(&self, query: &[f32], id: u32) -> f32 {
@@ -151,5 +193,20 @@ mod tests {
         let base = FloatVectors::from_raw(2, vec![5.0, 1.0, 5.0, 2.0, 5.0, 3.0]);
         let cb = Sq8Codebook::train(&base);
         assert_eq!(cb.dist(&[5.0, 1.0], 0), 0.0);
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let base = random_vectors(200, 16, 13);
+        let cb = Sq8Codebook::train(&base);
+        let path = std::env::temp_dir().join(format!("nvvec-sq8-{}", std::process::id()));
+        cb.save(&path).unwrap();
+        let loaded = Sq8Codebook::load(&path).unwrap();
+        assert_eq!((loaded.dim, loaded.count), (cb.dim, cb.count));
+        let q = base.get(7);
+        for id in [0u32, 5, 199] {
+            assert_eq!(loaded.dist(q, id), cb.dist(q, id));
+        }
+        std::fs::remove_file(&path).ok();
     }
 }

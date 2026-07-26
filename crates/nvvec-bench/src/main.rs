@@ -147,6 +147,25 @@ enum Cmd {
         #[arg(long)]
         csv: Option<PathBuf>,
     },
+    /// Convert a TEXMEX .bvecs file (u8 vectors, e.g. BIGANN) to .fvecs,
+    /// optionally truncating to the first N vectors.
+    Bvecs2fvecs {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        count: Option<usize>,
+    },
+    /// Train an SQ8 codebook from a dataset and save it (for nvvec-server).
+    TrainSq8 {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long, default_value = "sift")]
+        prefix: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -209,6 +228,24 @@ fn main() -> Result<()> {
         }),
         Cmd::Pipeline { data_dir, prefix, k, graph, index, ef, w, concurrency, direct, routing, queries, csv } => {
             pipeline_cmd(&data_dir, &prefix, k, &graph, &index, ef, w, &concurrency, direct, &routing, queries, csv.as_deref())
+        }
+        Cmd::Bvecs2fvecs { input, output, count } => bvecs2fvecs(&input, &output, count),
+        Cmd::TrainSq8 { data_dir, prefix, out } => {
+            use nvvec_core::scorer::RouteScorer as _;
+            let base = dataset::read_fvecs(&data_dir.join(format!("{prefix}_base.fvecs")))?;
+            let t = Instant::now();
+            let cb = nvvec_index::Sq8Codebook::train(&base);
+            cb.save(&out)?;
+            println!(
+                "sq8 codebook: {} x {} -> {} ({:.1} MB vs {:.1} MB raw) in {:.1?}",
+                cb.count,
+                cb.dim,
+                out.display(),
+                cb.memory_bytes() as f64 / 1e6,
+                (base.count * base.dim * 4) as f64 / 1e6,
+                t.elapsed()
+            );
+            Ok(())
         }
     }
 }
@@ -644,6 +681,40 @@ fn pipeline_sweep<S: nvvec_core::scorer::RouteScorer>(
             append_csv(path, method, &format!("R{}-ef{ef}-w{w}-c{c}", meta.r), k, recall, qps, None)?;
         }
     }
+    Ok(())
+}
+
+fn bvecs2fvecs(input: &Path, output: &Path, count: Option<usize>) -> Result<()> {
+    use std::io::{BufReader, BufWriter, Read, Write};
+    let mut r = BufReader::with_capacity(1 << 20, std::fs::File::open(input)?);
+    let mut w = BufWriter::with_capacity(1 << 20, std::fs::File::create(output)?);
+    let limit = count.unwrap_or(usize::MAX);
+    let mut written = 0usize;
+    let mut dim_buf = [0u8; 4];
+    let mut payload: Vec<u8> = Vec::new();
+    while written < limit {
+        match r.read_exact(&mut dim_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        let dim = u32::from_le_bytes(dim_buf) as usize;
+        if dim == 0 || dim > 65_536 {
+            bail!("implausible dimension {dim} at record {written}");
+        }
+        payload.resize(dim, 0);
+        r.read_exact(&mut payload)?;
+        w.write_all(&dim_buf)?;
+        for &b in &payload {
+            w.write_all(&(b as f32).to_le_bytes())?;
+        }
+        written += 1;
+        if written % 1_000_000 == 0 {
+            eprintln!("{written} vectors converted...");
+        }
+    }
+    w.flush()?;
+    println!("converted {written} vectors ({input:?} -> {output:?})");
     Ok(())
 }
 

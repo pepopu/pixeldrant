@@ -13,6 +13,9 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use nvvec_core::dataset::FloatVectors;
+use nvvec_core::distance::l2_sq;
+use nvvec_core::scorer::RouteScorer;
+use nvvec_core::topk::TopK;
 use nvvec_io::{BLOCK_SIZE, BlockRead, BlockReader, PreadReader};
 
 use crate::graph::VamanaGraph;
@@ -160,12 +163,13 @@ impl<R: BlockReader> DiskIndex<R> {
     }
 
     /// Beam search over the on-disk graph: one block read per expanded node,
-    /// `w` reads batched per round. Routing distances come from `base` (RAM)
-    /// in M2. `io_bufs` is reusable scratch, resized to `w` blocks here.
-    /// Returns (top-k ascending, block reads performed).
-    pub fn search(
+    /// `w` reads batched per round. Routing via `scorer` (exact RAM vectors
+    /// or quantized codes); every expanded node is reranked exactly against
+    /// the full-precision vector in its block, and the returned top-k comes
+    /// only from exact scores. Returns (top-k ascending, block reads).
+    pub fn search<S: RouteScorer>(
         &self,
-        base: &FloatVectors,
+        scorer: &S,
         query: &[f32],
         k: usize,
         ef: usize,
@@ -177,9 +181,11 @@ impl<R: BlockReader> DiskIndex<R> {
         let dim = self.meta.dim as usize;
         let (r, node_len) = (self.meta.r as usize, self.meta.node_len as usize);
         let mut io_err: Option<io::Error> = None;
+        let mut exact = TopK::new(k);
+        let mut decode_buf: Vec<f32> = Vec::with_capacity(dim);
 
         let reads = beam_search_batched(
-            base,
+            scorer,
             query,
             self.meta.medoid,
             ef,
@@ -201,6 +207,8 @@ impl<R: BlockReader> DiskIndex<R> {
                 for (i, &node) in frontier.iter().enumerate() {
                     let off = self.locate(node).1;
                     let bytes = &io_bufs[i * BLOCK_SIZE + off..i * BLOCK_SIZE + off + node_len];
+                    decode_vector(bytes, dim, &mut decode_buf);
+                    exact.push(l2_sq(query, &decode_buf), node);
                     out.extend(parse_neighbors(bytes, dim, r));
                 }
             },
@@ -209,15 +217,13 @@ impl<R: BlockReader> DiskIndex<R> {
         if let Some(e) = io_err {
             return Err(e);
         }
-        Ok((scratch.top_k(k).collect(), reads))
+        Ok((exact.into_sorted(), reads))
     }
 }
 
 /// Decode the little-endian f32 vector at the head of a node's bytes into a
 /// reusable buffer. Rerank then calls the ordinary `l2_sq` on it — same
 /// kernel, same summation order, bit-identical to RAM-based scoring.
-/// (Only the Linux pipeline uses it today; gate follows the caller.)
-#[cfg(target_os = "linux")]
 #[inline]
 pub(crate) fn decode_vector(node_bytes: &[u8], dim: usize, out: &mut Vec<f32>) {
     out.clear();
