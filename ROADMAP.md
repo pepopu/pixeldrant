@@ -61,9 +61,12 @@
 - [x] **M5 核心**(2026-07-27):HTTP 服务(axum,/search + /health,scratch 池,
   spawn_blocking,SQ8 码本持久化,端到端测试);`DiskIndex::search` 与流水线统一为
   scorer 泛型 + 块内精排单一路径。遗留 M5b:热点缓存、超内存建图
-- [~] **M6 第一代 benchmark**(进行中):SIFT1M 真 NVMe 正式数字已入 BENCHMARK.md;
-  BIGANN-10M(10 倍规模)建图中。Deep100M 级别留给二代(需更大内存建图或
-  超内存建图落地)
+- [x] **M6 第一代 benchmark**(2026-07-27 完成):SIFT1M + BIGANN-10M 真 NVMe
+  全套数字入 BENCHMARK.md。关键规模结论:10× 数据量下每查询读数仅 +8%(96→104),
+  磁盘版 sq8 单线程 = 内存版 4 线程的 50% QPS @ 1/5 内存;HTTP 服务在 10M 上
+  单查询 4.7ms。Deep100M/1B 级别留给二代(依赖 M5b 超内存建图)
+
+**第一代版本(v0.1)至此完成**:NVMe 原生磁盘向量索引,完整证据链,可服务化。
 
 二期:在线写入(SPFresh 式)、过滤、f16、多向量。
 
